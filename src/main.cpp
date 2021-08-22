@@ -26,11 +26,13 @@
  *
  */
 
+
 // Enable debug prints
 #define MY_DEBUG
 
 // Enable signal report functionalities
 #define MY_SIGNAL_REPORT_ENABLED
+#define MY_GPS_REPORT_ENABLED
 
 
 // Enable and select radio type attached
@@ -59,6 +61,19 @@ gateway fails*/
  */
 #define MY_TRANSPORT_WAIT_READY_MS (1000)
 
+// GPS position send interval (in millisectonds)
+#define GPS_SEND_INTERVAL 10000
+
+#ifdef MY_GPS_REPORT_ENABLED
+#include <TimeLib.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+
+void updateTime();
+#endif
+
+void gps_loop();
+
 #include <MySensors.h>
 
 // ID of the sensor child
@@ -69,7 +84,7 @@ gateway fails*/
 #define CHILD_ID_RX_RSSI        (4)
 #define CHILD_ID_TX_SNR         (5)
 #define CHILD_ID_RX_SNR         (6)
-
+#define CHILD_ID_GPS			(7)
 
 // Initialize general message
 MyMessage msgTxRSSI(CHILD_ID_TX_RSSI, V_CUSTOM);
@@ -80,16 +95,57 @@ MyMessage msgTxLevel(CHILD_ID_TX_LEVEL, V_CUSTOM);
 MyMessage msgTxPercent(CHILD_ID_TX_PERCENT, V_CUSTOM);
 MyMessage msgUplinkQuality(CHILD_ID_UPLINK_QUALITY, V_CUSTOM);
 
+#ifdef MY_GPS_REPORT_ENABLED
+MyMessage msg(CHILD_ID_GPS, V_POSITION);
+
+// This is where the pin TX pin of your GPS sensor is connected to the arduino
+static const int GPS_PIN = A0;
+
+// GPS Baud rate (note this is not the same as your serial montor baudrate). Most GPS modules uses 9600 bps.
+static const uint32_t GPSBaud = 9600;
+
+// Offset hours adjustment from gps time (UTC)
+const int offset = 1;
+
+// TinyGPS++ is used for parsing serial gps data
+TinyGPSPlus gps;
+
+// The serial connection to the GPS device
+// A5 pin can be left unconnected
+SoftwareSerial ss(GPS_PIN, A5);
+
+// Last time GPS position was sent to controller
+unsigned long lastGPSSent = 0;
+
+// Some buffers
+char latBuf[11];
+char lngBuf[11];
+char altBuf[6];
+char payload[30];
+char sz[64];
+
+#endif
+
 void setup()
 {
 	Serial.begin(115200);
+
+	// Set baudrate form gps communication
+	#ifdef MY_GPS_REPORT_ENABLED
+	ss.begin(GPSBaud);
+	#endif
 }
 
 
 void presentation()
 {
 	// Send the sketch version information to the gateway and controller
+	
+#ifdef MY_GPS_REPORT_ENABLED
+	sendSketchInfo("GPS Sensor", "1.0");
+#else
 	sendSketchInfo("ATC", "1.1");
+#endif
 
 	// Register all sensors to gw (they will be created as child devices)
 	present(CHILD_ID_UPLINK_QUALITY, S_CUSTOM, "UPLINK QUALITY RSSI");
@@ -99,6 +155,9 @@ void presentation()
 	present(CHILD_ID_RX_RSSI, S_CUSTOM, "RX RSSI");
 	present(CHILD_ID_TX_SNR, S_CUSTOM, "TX SNR");
 	present(CHILD_ID_RX_SNR, S_CUSTOM, "RX SNR");
+#ifdef MY_GPS_REPORT_ENABLED
+	present(CHILD_ID_GPS, S_GPS, "GPS INFO");
+#endif
 }
 
 void loop()
@@ -112,6 +171,73 @@ void loop()
 	send(msgRxRSSI.set(transportGetSignalReport(SR_RX_RSSI)));
 	send(msgTxSNR.set(transportGetSignalReport(SR_TX_SNR)));
 	send(msgRxSNR.set(transportGetSignalReport(SR_RX_SNR)));
+
+	gps_loop();
+	#ifdef MY_GPS_REPORT_ENABLED
+	wait(GPS_SEND_INTERVAL);
+	#else
 	// wait a bit
 	wait(5000);
+	#endif
 }
+
+
+void gps_loop()
+{
+#ifdef MY_GPS_REPORT_ENABLED
+  unsigned long currentTime = millis();
+
+  // Evaluate if it is time to send a new position
+  bool timeToSend = currentTime - lastGPSSent > GPS_SEND_INTERVAL;
+
+  // Read gps data
+  while (ss.available())
+    gps.encode(ss.read());
+
+  if (timeToSend) {
+    // Sync gps time with Arduino
+    updateTime();
+
+    // Send current gps location
+    if (gps.location.isValid() && gps.altitude.isValid()) {
+      // Build position and altitude string to send
+      dtostrf(gps.location.lat(), 1, 6, latBuf);
+      dtostrf(gps.location.lng(), 1, 6, lngBuf);
+      dtostrf(gps.altitude.meters(), 1, 0, altBuf);
+      sprintf(payload, "%s;%s;%s", latBuf, lngBuf, altBuf);
+
+      Serial.print(F("Position: "));
+      Serial.println(payload);
+
+      send(msg.set(payload));
+
+      Serial.print(F("GPS Time: "));
+      sprintf(sz, "%02d/%02d/%02d %02d:%02d:%02d", month(), day(), year(), hour(), minute(), second());
+      Serial.println(sz);
+
+
+    } else {
+      if (millis() > 5000 && gps.charsProcessed() < 10)
+        Serial.println(F("No GPS data received: check wiring"));
+      else
+        Serial.println(F("No GPS data received yet..."));
+    }
+    lastGPSSent = currentTime;
+  }
+#endif
+}
+
+#ifdef MY_GPS_REPORT_ENABLED
+void updateTime()
+{
+  TinyGPSDate d = gps.date;
+  TinyGPSTime t = gps.time;
+  if (d.isValid() && t.isValid()) {
+    // set the Time to the latest GPS reading if less then 0.2 seconds old
+    setTime(t.hour(), t.minute(), t.second(), d.day(), d.month(), d.year());
+    adjustTime(offset * SECS_PER_HOUR);
+    return;
+  }
+  Serial.println(F("Unable to adjust time from GPS"));
+}
+#endif
